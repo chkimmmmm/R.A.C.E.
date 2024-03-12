@@ -9,6 +9,9 @@ import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+import sys
+import json
+
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.util import instantiate_from_config
 import random
@@ -18,6 +21,44 @@ import shutil
 import pdb
 import argparse
 from convertModels import savemodelDiffusers
+
+
+def pgd_attack(unet, latent_model_input, t, text_embeddings, gaussian_noise, adv_loss, txt_min_max, num_iter=10, alpha=2/255, epsilon = 8/255, from_generation_code = True): 
+    #REF:https://adversarial-attacks-pytorch.readthedocs.io/en/latest/_modules/torchattacks/attacks/pgd.html#PGD
+    epsilon = epsilon
+    random_start = True
+    
+    conditional_emb = text_embeddings.clone().detach().to(text_embeddings.device)
+    adv_conditional_emb = conditional_emb.clone().detach()
+    
+    max_val = txt_min_max['max']
+    min_val = txt_min_max['min']
+    
+    if random_start:
+        adv_conditional_emb = adv_conditional_emb + torch.empty_like(adv_conditional_emb).uniform_(
+                -epsilon, epsilon)
+        adv_conditional_emb = torch.clamp(adv_conditional_emb, min=min_val, max=max_val).detach()
+    
+    for _ in range(num_iter):
+        adv_conditional_emb.requires_grad = True
+        
+        if from_generation_code:
+            noise_pred = unet(latent_model_input, t, encoder_hidden_states=adv_conditional_emb).sample
+        else:
+            noise_pred = unet.apply_model(latent_model_input, t, adv_conditional_emb)
+        
+        # - delta is necessary because we are minimizing the loss
+        loss = - adv_loss(gaussian_noise, noise_pred) 
+        grad = torch.autograd.grad(loss, adv_conditional_emb, retain_graph=False, create_graph=False)[0]
+        
+        adv_conditional_emb = adv_conditional_emb.detach() + alpha * grad.sign()
+        delta = torch.clamp(adv_conditional_emb - conditional_emb, min=-epsilon, max=epsilon)
+        adv_conditional_emb = torch.clamp(conditional_emb + delta, min=min_val, max=max_val).detach()
+                
+    
+    delta = adv_conditional_emb - conditional_emb
+    return adv_conditional_emb, delta, loss
+
 # Util Functions
 def load_model_from_config(config, ckpt, device="cpu", verbose=False):
     """Loads a model from config and a ckpt
@@ -102,7 +143,7 @@ def get_models(config_path, ckpt_path, devices):
 
     return model_orig, sampler_orig, model, sampler
 
-def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, seperator=None, image_size=512, ddim_steps=50):
+def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, saving_path, seperator=None, image_size=512, ddim_steps=50):
     '''
     Function to train diffusion models to erase concepts from model weights
 
@@ -159,6 +200,16 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
     # MODEL TRAINING SETUP
 
     model_orig, sampler_orig, model, sampler = get_models(config_path, ckpt_path, devices)
+    
+    if args.adv_train: #If it is adv training, load pretrained ESD model's weight.
+        try:
+            print("Adv Training is activated")
+            print("load Unet part from pretrained esd")
+            model_weight = torch.load(args.pretrained_esd, map_location=devices[0])
+            model.load_state_dict(model_weight)
+        except Exception as e:
+            print(f'Model path is not valid, please check the file name and structure: {e}')
+            exit() #This loading is important. So, if it fails, we need to exit.
 
     # choose parameters to train based on train_method
     parameters = []
@@ -206,20 +257,52 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
                                                                  x, image_size, image_size, ddim_steps, s, ddim_eta,
                                                                  start_code=code, till_T=t, verbose=False)
 
+    if args.lasso:
+        print("Lasso is activated")
+        lasso_loss_fn = torch.nn.L1Loss()
+        lasso_lambda = 0.1
+        original_parameters = [param.clone().detach() for param in parameters]
+
+
     losses = []
     opt = torch.optim.Adam(parameters, lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
 
-    name = f'compvis-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{negative_guidance}-iter_{iterations}-lr_{lr}'
+    if args.adv_train:
+        name = f'compvis-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{negative_guidance}-iter_{iterations}-lr_{lr}-adv-{args.atk_method}-eps-{args.epsilon}-exp-{args.exp_name}'
+    else:
+        name = f'compvis-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{negative_guidance}-iter_{iterations}-lr_{lr}'
+    
+    
+    folder_path = f'{saving_path}/{name}'
+    os.makedirs(folder_path, exist_ok=True)
+    args_dict = vars(args)
+    args_filename = os.path.join(folder_path, 'args_debug.json')
+    with open(args_filename, 'w') as f:
+        json.dump(args_dict, f, indent=4)
+    
+    
+    #RACE
+    if args.adv_train:
+        if args.adv_loss == "l1":
+            adv_loss = torch.nn.L1Loss()
+        elif args.adv_loss == "l2": #Default
+            adv_loss = torch.nn.MSELoss()
+        else:
+            raise ValueError('Invalid adv_loss')
+    
+    
     # TRAINING CODE
     pbar = tqdm(range(iterations))
     for i in pbar:
         word = random.sample(words,1)[0]
         # get text embeddings for unconditional and conditional prompts
-        emb_0 = model.get_learned_conditioning([''])
-        emb_p = model.get_learned_conditioning([word])
-        emb_n = model.get_learned_conditioning([f'{word}'])
+        emb_0 = model.get_learned_conditioning(['']) 
+        emb_p = model.get_learned_conditioning([word]) 
+        emb_n = model.get_learned_conditioning([f'{word}']) 
+        
+        txt_emb_min_max = {'min': emb_n.min(), 'max': emb_n.max()}
 
         opt.zero_grad()
 
@@ -238,40 +321,57 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
             # get conditional and unconditional scores from frozen model at time step t and image z
             e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
             e_p = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_p.to(devices[1]))
+        
+        if args.adv_train:
+            if args.use_image_guidance:
+                raise ValueError('Image guidance not implemented yet')
+            else:
+                attacked_emb_n, delta, loss = pgd_attack(model, z, t_enc_ddpm, emb_n.to(devices[0]), start_code, adv_loss, txt_emb_min_max, alpha=args.epsilon/4., num_iter=10, epsilon = args.epsilon, from_generation_code=False)
+        else:
+            attacked_emb_n = emb_n
+            
         # breakpoint()
         # get conditional score from ESD model
-        e_n = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_n.to(devices[0]))
+        e_n = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), attacked_emb_n.to(devices[0]))
         e_0.requires_grad = False
         e_p.requires_grad = False
         # reconstruction loss for ESD objective from frozen model and conditional score of ESD model
         loss = criteria(e_n.to(devices[0]), e_0.to(devices[0]) - (negative_guidance*(e_p.to(devices[0]) - e_0.to(devices[0])))) #loss = criteria(e_n, e_0) works the best try 5000 epochs
+        if args.lasso:
+            lasso_loss = sum(lasso_loss_fn(param, original_param) for param, original_param in zip(parameters, original_parameters))
+            loss += lasso_lambda * lasso_loss
         # update weights to erase the concept
         loss.backward()
         losses.append(loss.item())
         pbar.set_postfix({"loss": loss.item()})
         history.append(loss.item())
         opt.step()
+                
+        if loss > 500.:
+            raise ValueError('Loss is too high, training is not working')
+        
         # save checkpoint and loss curve
-        if (i+1) % 500 == 0 and i+1 != iterations and i+1>= 500:
-            save_model(model, name, i-1, save_compvis=True, save_diffusers=False)
+        if (i+1) % 1000 == 0 and i+1 != iterations and i+1>= 500:
+            #save_model(model, name, i-1, saving_path, save_compvis=True, save_diffusers=False)
+            save_model(model, name, i, saving_path = saving_path, save_compvis=True, save_diffusers=True, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
 
-        if i % 100 == 0:
-            save_history(losses, name, word_print)
+        # if i % 10 == 0:
+        #     save_history(losses, name, word_print, saving_path)
 
     model.eval()
+    save_model(model, name, args.iterations, saving_path = saving_path, save_compvis=True, save_diffusers=True, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
+    save_history(losses, name, word_print, saving_path)
 
-    save_model(model, name, None, save_compvis=True, save_diffusers=True, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
-    save_history(losses, name, word_print)
-
-def save_model(model, name, num, compvis_config_file=None, diffusers_config_file=None, device='cpu', save_compvis=True, save_diffusers=True):
+def save_model(model, name, num, saving_path, compvis_config_file=None, diffusers_config_file=None, device='cpu', save_compvis=True, save_diffusers=True):
     # SAVE MODEL
 
 #     PATH = f'{FOLDER}/{model_type}-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{neg_guidance}-iter_{i+1}-lr_{lr}-startmodel_{start_model}-numacc_{numacc}.pt'
 
-    folder_path = f'models/{name}'
+    folder_path = os.path.join(saving_path, name)
     os.makedirs(folder_path, exist_ok=True)
+    name = f'{name}-epoch_{num}'
     if num is not None:
-        path = f'{folder_path}/{name}-epoch_{num}.pt'
+        path = f'{folder_path}/{name}.pt'
     else:
         path = f'{folder_path}/{name}.pt'
     if save_compvis:
@@ -279,10 +379,11 @@ def save_model(model, name, num, compvis_config_file=None, diffusers_config_file
 
     if save_diffusers:
         print('Saving Model in Diffusers Format')
-        savemodelDiffusers(name, compvis_config_file, diffusers_config_file, device=device )
+        savemodelDiffusers(name, compvis_config_file, diffusers_config_file, saving_path=folder_path, device=device)
 
-def save_history(losses, name, word_print):
-    folder_path = f'models/{name}'
+def save_history(losses, name, word_print, saving_path):
+    folder_path = f'{saving_path}/{name}'
+    #folder_path = os.path.join(saving_path, name)
     os.makedirs(folder_path, exist_ok=True)
     with open(f'{folder_path}/loss.txt', 'w') as f:
         f.writelines([str(i) for i in losses])
@@ -297,14 +398,25 @@ if __name__ == '__main__':
     parser.add_argument('--start_guidance', help='guidance of start image used to train', type=float, required=False, default=3)
     parser.add_argument('--negative_guidance', help='guidance of negative training used to train', type=float, required=False, default=1)
     parser.add_argument('--iterations', help='iterations used to train', type=int, required=False, default=1000)
-    parser.add_argument('--lr', help='learning rate used to train', type=int, required=False, default=1e-5)
+    parser.add_argument('--lr', help='learning rate used to train', type=float, required=False, default=1e-5)
     parser.add_argument('--config_path', help='config path for stable diffusion v1-4 inference', type=str, required=False, default='configs/stable-diffusion/v1-inference.yaml')
     parser.add_argument('--ckpt_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt')
+    parser.add_argument('--saving_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt')
     parser.add_argument('--diffusers_config_path', help='diffusers unet config json path', type=str, required=False, default='diffusers_unet_config.json')
     parser.add_argument('--devices', help='cuda devices to train on', type=str, required=False, default='0,0')
     parser.add_argument('--seperator', help='separator if you want to train bunch of words separately', type=str, required=False, default=None)
     parser.add_argument('--image_size', help='image size used to train', type=int, required=False, default=512)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
+    parser.add_argument('--adv_train', help="adv training", action='store_true')
+    parser.add_argument('--atk_method', help="atk method", type=str, default="")
+    parser.add_argument('--epsilon', help="adv attack epsilon", type=float, default=0.1)
+    parser.add_argument('--pgd_num_step', help="numstep for PGD", type=int, default=10)
+    parser.add_argument('--use_image_guidance', help="use image guidance", action='store_true')
+    parser.add_argument('--pretrained_esd', help="use pretrained esd", type=str)
+    parser.add_argument('--limited_timesteps', help="nesting txt embedding", action='store_true')
+    parser.add_argument('--adv_loss', help="l2, l1", type=str)
+    parser.add_argument('--lasso', help="Lasso", action = 'store_true')
+    parser.add_argument('--exp_name', help="experiment_name", type=str, default="")
     args = parser.parse_args()
     
     prompt = args.prompt
@@ -320,5 +432,6 @@ if __name__ == '__main__':
     seperator = args.seperator
     image_size = args.image_size
     ddim_steps = args.ddim_steps
+    saving_path = args.saving_path
 
-    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps)
+    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps, saving_path=saving_path)
