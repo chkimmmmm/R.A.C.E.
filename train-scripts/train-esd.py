@@ -323,10 +323,7 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
             e_p = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_p.to(devices[1]))
         
         if args.adv_train:
-            if args.use_image_guidance:
-                raise ValueError('Image guidance not implemented yet')
-            else:
-                attacked_emb_n, delta, loss = pgd_attack(model, z, t_enc_ddpm, emb_n.to(devices[0]), start_code, adv_loss, txt_emb_min_max, alpha=args.epsilon/4., num_iter=10, epsilon = args.epsilon, from_generation_code=False)
+            attacked_emb_n, delta, loss = pgd_attack(model, z, t_enc_ddpm, emb_n.to(devices[0]), start_code, adv_loss, txt_emb_min_max, alpha=args.epsilon/4., num_iter=10, epsilon = args.epsilon, from_generation_code=False)
         else:
             attacked_emb_n = emb_n
             
@@ -408,13 +405,11 @@ if __name__ == '__main__':
     parser.add_argument('--image_size', help='image size used to train', type=int, required=False, default=512)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
     parser.add_argument('--adv_train', help="adv training", action='store_true')
-    parser.add_argument('--atk_method', help="atk method", type=str, default="")
+    parser.add_argument('--atk_method', help="atk method", type=str, default="pgd")
     parser.add_argument('--epsilon', help="adv attack epsilon", type=float, default=0.1)
     parser.add_argument('--pgd_num_step', help="numstep for PGD", type=int, default=10)
-    parser.add_argument('--use_image_guidance', help="use image guidance", action='store_true')
     parser.add_argument('--pretrained_esd', help="use pretrained esd", type=str)
-    parser.add_argument('--limited_timesteps', help="nesting txt embedding", action='store_true')
-    parser.add_argument('--adv_loss', help="l2, l1", type=str)
+    parser.add_argument('--adv_loss', help="l2, l1", type=str, default="l2")
     parser.add_argument('--lasso', help="Lasso", action = 'store_true')
     parser.add_argument('--exp_name', help="experiment_name", type=str, default="")
     args = parser.parse_args()
