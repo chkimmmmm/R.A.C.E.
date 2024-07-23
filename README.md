@@ -4,7 +4,9 @@ In the evolving landscape of text-to-image (T2I) diffusion models, the remarkabl
 This work underlines the essential need for proactive defense measures in adapting to the rapidly advancing field of adversarial challenges.
 
 ## News
+Arxiv Link: https://arxiv.org/abs/2405.16341\
 (2024.7.1) **R.A.C.E.** is accepted at ECCV.
+
 
 ## Motivation
 ![Figure 1](images/fig1.png)
