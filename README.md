@@ -10,7 +10,7 @@ This work underlines the essential need for proactive defense measures in adapti
 
 ## News
 Arxiv Link: [https://arxiv.org/abs/2405.16341](https://arxiv.org/abs/2405.16341)  
-(2024.7.1) **R.A.C.E.** is accepted at ECCV.
+(2024.7.1) **R.A.C.E.** is accepted as an Oral paper at ECCV'24.
 
 
 ## Motivation
